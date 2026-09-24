@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>MyCity — Réclame ton terrain, bâtis ta marque</title>
+  <meta name="description" content="Une ville numérique vivante où chacun peut acheter un terrain, y construire son immeuble sur mesure et y afficher sa marque." />
+  <meta name="theme-color" content="#161a17" />
+  <meta property="og:title" content="MyCity — Réclame ton terrain, bâtis ta marque" />
+  <meta property="og:description" content="Achète un terrain, dessine ton immeuble, affiche ta marque dans une ville isométrique vivante." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/css/fonts.css" />
+  <link rel="stylesheet" href="/css/app.css" />
+  <script type="module" src="/js/main.js"></script>
+</head>
+<body>
+  <div id="loader" class="loader" role="status">
+    <div class="loader-skyline" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+    <p>CHARGEMENT DE LA VILLE</p>
+  </div>
+
+  <canvas id="city" aria-label="Carte isométrique de MyCity" tabindex="0"></canvas>
+
+  <div id="announcement" class="announcement" hidden></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="MyCity, accueil">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-text"><strong>MyCity</strong><small>Réclame ton terrain, bâtis ta marque</small></span>
+    </a>
+
+    <div class="search" role="search">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="search" type="search" placeholder="Rechercher un terrain, une marque, un habitant…" autocomplete="off" aria-label="Rechercher" />
+      <div id="search-results" class="search-results" hidden></div>
+    </div>
+
+    <nav class="top-actions">
+      <span class="online" title="Visiteurs connectés en direct"><i class="dot"></i><span id="online-count">1</span><span class="hide-sm">&nbsp;en ligne</span></span>
+      <button class="btn ghost hide-sm" data-action="leaderboard">Classement</button>
+      <button class="btn ghost hide-sm" data-action="stats">Statistiques</button>
+      <button class="btn ghost icon-only show-sm" data-action="menu" aria-label="Menu">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <div id="account-slot"></div>
+    </nav>
+  </header>
+
+  <aside class="toolbar" aria-label="Outils de navigation">
+    <button data-action="zoom-in" title="Zoomer (+)"><svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+    <button data-action="zoom-out" title="Dézoomer (-)"><svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+    <button data-action="rotate" title="Pivoter la vue (R)"><svg class="icon" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></button>
+    <button data-action="home" title="Recentrer sur l'Hôtel de Ville (H)"><svg class="icon" viewBox="0 0 24 24"><path d="M3 11 12 4l9 7"/><path d="M5 10v10h14V10"/></svg></button>
+    <span class="sep"></span>
+    <button data-action="daynight" title="Jour / nuit (N)"><svg class="icon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+    <button data-action="labels" title="Afficher les enseignes (L)"><svg class="icon" viewBox="0 0 24 24"><path d="M4 4h10l6 8-6 8H4z"/></svg></button>
+    <button data-action="heatmap" title="Carte des prix et de l'occupation (P)"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></button>
+    <button data-action="tour" title="Visite guidée (V)"><svg class="icon" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></svg></button>
+  </aside>
+
+  <section id="feed" class="feed" aria-label="Fil d'activité">
+    <button class="feed-head" data-action="toggle-feed" aria-expanded="true">
+      <span><i class="dot"></i> En direct dans MyCity</span>
+      <svg class="icon chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <ol id="feed-list" class="feed-list"></ol>
+  </section>
+
+  <div class="minimap-wrap">
+    <canvas id="minimap" width="180" height="180" aria-label="Mini-carte"></canvas>
+  </div>
+
+  <div class="cta-wrap">
+    <p class="hint" id="hint">Glissez pour explorer · molette ou pincement pour zoomer · <kbd>R</kbd> pour pivoter</p>
+    <button class="btn primary cta" data-action="claim-random" id="cta">Réclamer un terrain</button>
+  </div>
+
+  <aside id="panel" class="panel" aria-live="polite" hidden></aside>
+  <div id="modal-root"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="tooltip" class="map-tooltip" hidden></div>
+
+  <footer class="legal">
+    <a href="/conditions">Conditions</a> · <a href="/confidentialite">Confidentialité</a>
+  </footer>
+</body>
+</html>

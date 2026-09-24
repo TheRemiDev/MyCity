@@ -1,0 +1,25 @@
+{
+  "name": "mycity",
+  "version": "1.0.0",
+  "description": "MyCity — une ville numérique isométrique où chacun peut acheter un terrain, y construire son immeuble et y afficher sa marque.",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheRemiDev/MyCity.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
