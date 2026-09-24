@@ -11,7 +11,8 @@
     "start": "node --disable-warning=ExperimentalWarning server.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
-    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js"
+    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js"
   },
   "repository": {
     "type": "git",

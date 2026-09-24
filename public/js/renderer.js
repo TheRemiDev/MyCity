@@ -24,9 +24,15 @@ import { state, plotState, districtInfo } from './state.js';
 const MIN_ZOOM = 0.22;
 const MAX_ZOOM = 3.2;
 const MAX_SPRITES = 700;
+const PROFILE = new URLSearchParams(location.search).has('profile');
 
 export function createRenderer(canvas, { onSelect, onHover, onCamera } = {}) {
-  const ctx = canvas.getContext('2d');
+  const mainCtx = canvas.getContext('2d');
+  let ctx = mainCtx; // cible de dessin courante (écran ou cache du sol)
+  const groundCanvas = document.createElement('canvas');
+  const groundCtx = groundCanvas.getContext('2d');
+  let groundKey = '';
+  let groundVersion = 0;
   const city = state.city;
   const S = city.size;
   const cam = { x: 0, y: 0, zoom: 1, rot: 0 };
@@ -163,6 +169,9 @@ export function createRenderer(canvas, { onSelect, onHover, onCamera } = {}) {
     height = canvas.clientHeight;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
+    groundCanvas.width = canvas.width;
+    groundCanvas.height = canvas.height;
+    groundKey = '';
   }
 
   // ---------------------------------------------------------------- ambiance
@@ -226,8 +235,10 @@ export function createRenderer(canvas, { onSelect, onHover, onCamera } = {}) {
 
   function invalidateAll() {
     sprites.clear();
+    groundVersion++;
   }
   function invalidatePlot(number) {
+    groundVersion++;
     for (const key of sprites.keys()) if (key.startsWith(`p${number}:`)) sprites.delete(key);
   }
 
@@ -843,25 +854,35 @@ export function createRenderer(canvas, { onSelect, onHover, onCamera } = {}) {
   }
   let visibleCache = [];
 
+  // Ordre de dessin (arrière -> avant) précalculé pour chaque orientation : aucun tri par image.
+  const orderByRot = [0, 1, 2, 3].map((r) => {
+    const idx = [];
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) idx.push([x, y]);
+    const depth = ([x, y]) => rotate(x, y, r).reduce((a, b) => a + b, 0);
+    return idx.sort((a, b) => depth(a) - depth(b));
+  });
+  const tileMeta = new Map();
+  function meta(x, y) {
+    const i = city.idx(x, y);
+    let m = tileMeta.get(i);
+    if (!m) {
+      const key = `${x},${y}`;
+      m = { i, t: city.tiles[i], lot: lotAt.get(key), board: boardAt.get(key), landmark: landmarkAt.get(key) };
+      tileMeta.set(i, m);
+    }
+    return m;
+  }
+
   function visibleTiles() {
     const out = [];
     const margin = 120 * cam.zoom;
     const tall = 520 * cam.zoom; // immeubles hauts dont la base est hors écran
-    for (let y = 0; y < S; y++) {
-      for (let x = 0; x < S; x++) {
-        const [sx, sy] = worldToScreen(x + 0.5, y + 0.5);
-        if (sx < -margin || sx > width + margin || sy < -margin || sy > height + tall) continue;
-        const i = city.idx(x, y);
-        const key = `${x},${y}`;
-        out.push({ x, y, i, t: city.tiles[i], sx, sy, lot: lotAt.get(key), board: boardAt.get(key), landmark: landmarkAt.get(key) });
-      }
+    for (const [x, y] of orderByRot[cam.rot]) {
+      const [sx, sy] = worldToScreen(x + 0.5, y + 0.5);
+      if (sx < -margin || sx > width + margin || sy < -margin || sy > height + tall) continue;
+      const m = meta(x, y);
+      out.push({ x, y, i: m.i, t: m.t, sx, sy, lot: m.lot, board: m.board, landmark: m.landmark });
     }
-    // ordre de dessin du sol : de l'arrière vers l'avant
-    out.sort((a, b) => {
-      const [a1, a2] = rotate(a.x, a.y);
-      const [b1, b2] = rotate(b.x, b.y);
-      return a1 + a2 - (b1 + b2);
-    });
     return out;
   }
 
@@ -886,18 +907,34 @@ export function createRenderer(canvas, { onSelect, onHover, onCamera } = {}) {
     traffic?.update(dt);
     const amb = ambience();
     const night = amb.night;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = night ? '#0e1526' : '#b7c3bb';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
+    const P = PROFILE ? {} : null;
+    let t0 = performance.now();
     visibleCache = visibleTiles();
-    drawGround(night, visibleCache);
+    if (P) { P.visible = performance.now() - t0; t0 = performance.now(); }
+    // Le sol est mis en cache : il n'est redessiné que si la vue ou la ville change (et ~1×/s pour l'eau).
+    const key = `${cam.x.toFixed(2)}|${cam.y.toFixed(2)}|${cam.zoom.toFixed(4)}|${cam.rot}|${night}|${state.settings.heatmap}|${groundVersion}|${width}x${height}|${Math.floor(time / 900)}`;
+    if (key !== groundKey) {
+      groundKey = key;
+      ctx = groundCtx;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = night ? '#0e1526' : '#b7c3bb';
+      ctx.fillRect(0, 0, groundCanvas.width, groundCanvas.height);
+      drawGround(night, visibleCache);
+      ctx = mainCtx;
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(groundCanvas, 0, 0);
+    if (P) { P.ground = performance.now() - t0; t0 = performance.now(); }
     drawSelection(visibleCache, night);
     drawBoats(night);
-    drawObjects(collectObjects(visibleCache, night), night);
+    const objs = collectObjects(visibleCache, night);
+    if (P) { P.collect = performance.now() - t0; t0 = performance.now(); }
+    drawObjects(objs, night);
+    if (P) { P.objects = performance.now() - t0; t0 = performance.now(); }
     drawWeather(dt, amb);
     drawLabels();
     drawMarker();
+    if (P) { P.overlay = performance.now() - t0; window.__mcProfile = P; }
     requestAnimationFrame(frame);
   }
 

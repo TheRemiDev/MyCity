@@ -229,6 +229,7 @@ function connectLive() {
   });
   es.addEventListener('districts', (e) => {
     state.districts = JSON.parse(e.data).districts;
+    renderer.invalidateAll();
     minimap.invalidate();
     updateCta();
   });

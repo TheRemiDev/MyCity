@@ -36,6 +36,14 @@ export function createLiveHub({ heartbeatMs = 25_000 } = {}) {
 
   return {
     attach(req, res, { visitor, userId }) {
+      // Garde-fous : pas plus de 8 flux par visiteur ni de 5000 au total.
+      let mine = 0;
+      for (const c of clients) if (c.visitor === visitor) mine++;
+      if (mine >= 8 || clients.size >= 5000) {
+        res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '30' });
+        res.end('Trop de connexions temps réel.');
+        return;
+      }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',

@@ -1,5 +1,9 @@
+import fs from 'node:fs';
 import { loadConfig } from './src/config.js';
 import { createApp } from './src/app.js';
+
+// En développement, un fichier .env à la racine est chargé s'il existe (en production : EnvironmentFile systemd).
+if (fs.existsSync('.env')) process.loadEnvFile('.env');
 
 const config = loadConfig();
 const { app, close } = createApp(config);

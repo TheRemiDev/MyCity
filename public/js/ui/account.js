@@ -141,7 +141,7 @@ export function openAuth(mode = 'login') {
 export function openSetup({ tokenRequired }) {
   const token = new URLSearchParams(location.search).get('setup') || '';
   openModal({
-    title: 'Bienvenue, Monsieur le Maire',
+    title: 'Bienvenue à la mairie',
     content: (body, close) => {
       const err = h('div', { class: 'error-box', hidden: true });
       const f = {
