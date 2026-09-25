@@ -20,14 +20,18 @@
 #    update     met à jour le code et redémarre (conserve données et réglages)
 #    status     état du service
 #    backup     sauvegarde immédiate de la base
-#    uninstall  désinstalle (conserve les données sauf --purge)
+#    uninstall  désinstalle : voir deploy/uninstall.sh (efface toute trace de MyCity)
 #
 #  Options :
 #    --domain D            nom de domaine (obligatoire à l'installation)
 #    --email E             e-mail Let's Encrypt (obligatoire sauf --no-tls)
 #    --name N              nom de l'instance (défaut : mycity)
 #    --port P              port interne (défaut : premier port libre à partir de 3080)
-#    --web-server S        auto | nginx | apache | caddy | none (défaut : auto)
+#    --web-server S        auto | nginx | apache | caddy | docker | none (défaut : auto)
+#                          « docker » : s'intègre au proxy Docker existant (Traefik, Coolify, Dokploy,
+#                          Nginx Proxy Manager, nginx-proxy, caddy-docker-proxy, Caddy)
+#    --npm-email E         identifiants Nginx Proxy Manager (sinon demandés, ou NPM_EMAIL/NPM_PASSWORD)
+#    --npm-password P
 #    --no-tls              pas de certificat (HTTP seul, déconseillé)
 #    --stripe-key K        clé secrète Stripe (sk_live_… ou sk_test_…)
 #    --stripe-webhook W    secret du webhook Stripe (whsec_…)
@@ -36,7 +40,6 @@
 #    --node-major M        version majeure de Node.js (défaut : 22)
 #    --www                 ajoute aussi www.<domaine> au certificat et au site
 #    --skip-dns-check      ne vérifie pas que le domaine pointe vers ce serveur
-#    --purge               (uninstall) supprime aussi les données
 #    -y, --yes             ne pose aucune question
 # =============================================================================
 set -Eeuo pipefail
@@ -56,14 +59,26 @@ BRANCH="main"
 NODE_MAJOR="22"
 WITH_WWW=0
 DNS_CHECK=1
-PURGE=0
 ASSUME_YES=0
+NPM_EMAIL="${NPM_EMAIL:-}"
+NPM_PASSWORD="${NPM_PASSWORD:-}"
+MODE="host"                      # host : service systemd natif · docker : conteneur derrière un proxy Docker
+DOCKER_IMAGE="debian:bookworm-slim"
+PKGS_ADDED=""
+CLOUDFLARE=0
+PUBLIC_SCHEME=""
 DEFAULT_REPO="https://github.com/TheRemiDev/MyCity.git"
 INSTALL_SOURCE=""
 
 case "${1:-}" in
   install|update|status|backup|uninstall) ACTION="$1"; shift ;;
 esac
+if [[ "$ACTION" == uninstall ]]; then
+  # La désinstallation est un programme autonome (il doit survivre à la suppression de l'application).
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+  for u in "$here/uninstall.sh" /usr/local/sbin/mycity-uninstall; do [[ -f "$u" ]] && exec bash "$u" "$@"; done
+  echo "Programme de désinstallation introuvable (deploy/uninstall.sh)." >&2; exit 1
+fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain) DOMAIN="${2:-}"; shift 2 ;;
@@ -79,7 +94,8 @@ while [[ $# -gt 0 ]]; do
     --node-major) NODE_MAJOR="${2:-}"; shift 2 ;;
     --www) WITH_WWW=1; shift ;;
     --skip-dns-check) DNS_CHECK=0; shift ;;
-    --purge) PURGE=1; shift ;;
+    --npm-email) NPM_EMAIL="${2:-}"; shift 2 ;;
+    --npm-password) NPM_PASSWORD="${2:-}"; shift 2 ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) echo "Option inconnue : $1 (voir --help)" >&2; exit 2 ;;
@@ -113,6 +129,9 @@ ENV_FILE="$CONF_DIR/$NAME.env"
 SERVICE="$NAME.service"
 USER_NAME="$NAME"
 ACME_ROOT="/var/www/$NAME-acme"
+STATE_FILE="$CONF_DIR/install.state"   # inventaire de tout ce que l'installation a créé (pour la désinstallation)
+MARKER_DIR="/etc/mycity-instances"
+CONTAINER="$NAME"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
 SOURCE_DIR=""
 [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/../package.json" && -f "$SCRIPT_DIR/../server.js" ]] && SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -150,10 +169,21 @@ pkg_install() {
     dnf|yum) "$PKG" install -y -q "${missing[@]}" >/dev/null ;;
     *) die "Gestionnaire de paquets non pris en charge : installez ${missing[*]} manuellement." ;;
   esac
+  PKGS_ADDED="$PKGS_ADDED ${missing[*]}"
+  [[ -d "$CONF_DIR" ]] && state_flush_pkgs
+  return 0
 }
 
 port_in_use() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q . ; }
 listener_on() { { ss -Hltnp "sport = :$1" 2>/dev/null | grep -oE 'users:\(\("[^"]+' | head -1 | sed 's/users:(("//'; } || true; }
+listener_pid() { { ss -Hltnp "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2; } || true; }
+# Vrai si le processus qui écoute sur ce port tourne dans un conteneur (réseau « host » ou docker-proxy).
+listener_in_container() {
+  local pid; pid="$(listener_pid "$1")"
+  [[ -n "$pid" && -e "/proc/$pid/root" ]] || return 1
+  [[ "$(stat -Lc %d:%i "/proc/$pid/root" 2>/dev/null)" != "$(stat -Lc %d:%i / 2>/dev/null)" ]]
+}
+docker_ok() { command -v docker >/dev/null && docker info >/dev/null 2>&1; }
 service_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
 env_get() { [[ -f "$ENV_FILE" ]] && grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true; }
@@ -166,6 +196,28 @@ env_set() { # env_set KEY VALUE : met à jour ou ajoute une variable
   else
     echo "$key=$val" >> "$ENV_FILE"
   fi
+}
+
+# Inventaire de l'installation : chaque élément créé y est noté, pour une désinstallation sans trace
+# qui ne touche jamais à ce qui existait avant MyCity.
+state_get() { [[ -f "$STATE_FILE" ]] && grep -E "^$1=" "$STATE_FILE" | tail -1 | cut -d= -f2- || true; }
+state_set() {
+  install -d -m 750 "$CONF_DIR"
+  [[ -f "$STATE_FILE" ]] || install -m 600 /dev/null "$STATE_FILE"
+  local tmp; tmp="$(mktemp)"
+  grep -vE "^$1=" "$STATE_FILE" > "$tmp" || true
+  echo "$1=$2" >> "$tmp"
+  cat "$tmp" > "$STATE_FILE"; rm -f "$tmp"
+}
+state_add() { # ajoute une valeur à une liste (séparateur : espace), sans doublon
+  local cur; cur="$(state_get "$1")"
+  [[ " $cur " == *" $2 "* ]] && return 0
+  state_set "$1" "${cur:+$cur }$2"
+}
+state_flush_pkgs() {
+  local p
+  for p in $PKGS_ADDED; do state_add PKGS "$p"; done
+  PKGS_ADDED=""
 }
 
 random_token() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
@@ -238,12 +290,19 @@ deploy_code() {
 # ----------------------------------------------------------------- utilisateur, dossiers, configuration
 setup_user_and_config() {
   step "Utilisateur système et configuration"
+  USER_CREATED=0
   if ! id "$USER_NAME" >/dev/null 2>&1; then
+    USER_CREATED=1
     useradd --system --home-dir "$DATA" --no-create-home --shell /usr/sbin/nologin "$USER_NAME"
     ok "Utilisateur $USER_NAME créé"
   else ok "Utilisateur $USER_NAME existant"; fi
   install -d -m 750 -o "$USER_NAME" -g "$USER_NAME" "$DATA" "$DATA/backups"
   install -d -m 750 -o root -g "$USER_NAME" "$CONF_DIR"
+  install -d -m 755 "$MARKER_DIR"
+  echo "$NAME" > "$MARKER_DIR/$NAME"
+  state_set INSTANCE "$NAME"
+  [[ -n "$(state_get USER_CREATED)" ]] || state_set USER_CREATED "$USER_CREATED"
+  state_flush_pkgs
 
   if [[ ! -f "$ENV_FILE" ]]; then
     install -m 640 -o root -g "$USER_NAME" /dev/null "$ENV_FILE"
@@ -257,7 +316,6 @@ setup_user_and_config() {
   env_set PORT "$PORT"
   env_set BASE_URL "$scheme://$DOMAIN"
   env_set DB_PATH "$DATA/mycity.db"
-  env_set TRUST_PROXY 1
   [[ -n "$(env_get SETUP_TOKEN)" ]] || env_set SETUP_TOKEN "$(random_token)"
   env_set INSTALL_REPO "$INSTALL_SOURCE"
   env_set INSTALL_BRANCH "$BRANCH"
@@ -270,8 +328,38 @@ setup_user_and_config() {
 }
 
 # ----------------------------------------------------------------- systemd
-setup_service() {
-  step "Service systemd $SERVICE"
+write_backup_units() {
+  # Sauvegarde quotidienne (14 jours conservés) — exécutée par le Node privé, même en mode Docker.
+  cat > "/etc/systemd/system/$NAME-backup.service" <<UNIT
+[Unit]
+Description=Sauvegarde de la base MyCity ($NAME)
+
+[Service]
+Type=oneshot
+User=$USER_NAME
+Group=$USER_NAME
+EnvironmentFile=$ENV_FILE
+ExecStart=$RUNTIME/bin/node --disable-warning=ExperimentalWarning $APP/scripts/backup.js $DATA/backups 14
+ProtectSystem=strict
+ReadWritePaths=$DATA
+PrivateTmp=true
+NoNewPrivileges=true
+UNIT
+  cat > "/etc/systemd/system/$NAME-backup.timer" <<UNIT
+[Unit]
+Description=Sauvegarde quotidienne de MyCity ($NAME)
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+write_host_unit() {
   cat > "/etc/systemd/system/$SERVICE" <<UNIT
 [Unit]
 Description=MyCity ($NAME) — ville numérique
@@ -320,43 +408,104 @@ UMask=0027
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
 
-  # Sauvegarde quotidienne (14 jours conservés)
-  cat > "/etc/systemd/system/$NAME-backup.service" <<UNIT
+# Mode Docker : l'application tourne dans un conteneur minimal (image Debian officielle), qui réutilise
+# le Node privé et le code installés sur l'hôte (montés en lecture seule). Aucune image à construire.
+ensure_docker_image() {
+  docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1 && return 0
+  local img
+  for img in "$DOCKER_IMAGE" "mirror.gcr.io/library/$DOCKER_IMAGE" "public.ecr.aws/docker/library/$DOCKER_IMAGE"; do
+    if docker pull -q "$img" >/dev/null 2>&1; then
+      [[ "$img" != "$DOCKER_IMAGE" ]] && docker tag "$img" "$DOCKER_IMAGE" && docker rmi "$img" >/dev/null 2>&1
+      state_set DOCKER_IMAGE_PULLED 1
+      ok "Image $DOCKER_IMAGE téléchargée"
+      return 0
+    fi
+  done
+  die "Impossible de télécharger l'image $DOCKER_IMAGE (Docker Hub injoignable ?)."
+}
+
+write_docker_unit() {
+  local existing
+  existing="$(docker inspect -f '{{index .Config.Labels "mycity.instance"}}' "$CONTAINER" 2>/dev/null || true)"
+  if docker inspect "$CONTAINER" >/dev/null 2>&1 && [[ "$existing" != "$NAME" ]]; then
+    die "Un conteneur « $CONTAINER » qui n'appartient pas à MyCity existe déjà. Choisissez un autre nom d'instance (--name)."
+  fi
+  ensure_docker_image
+  state_set DOCKER_IMAGE "$DOCKER_IMAGE"
+  local uid gid net publish
+  uid="$(id -u "$USER_NAME")"; gid="$(id -g "$USER_NAME")"
+  net="$(state_get DOCKER_NET)"; publish="$(state_get DOCKER_PUBLISH)"
+  touch "$CONF_DIR/docker.labels" "$CONF_DIR/docker.env"
+  chmod 640 "$CONF_DIR/docker.labels" "$CONF_DIR/docker.env"
+  cat > "$CONF_DIR/run-container.sh" <<RUN
+#!/usr/bin/env bash
+# Lancement du conteneur MyCity ($NAME) — généré par deploy/install.sh
+exec docker run --rm --name "$CONTAINER" --hostname "$CONTAINER" \\
+  ${net:+--network "$net" --network-alias "$CONTAINER"} ${publish:+-p "$publish"} \\
+  --label "mycity.instance=$NAME" --label-file "$CONF_DIR/docker.labels" \\
+  --env-file "$ENV_FILE" --env-file "$CONF_DIR/docker.env" -e HOST=0.0.0.0 -e PORT=3000 \\
+  --user "$uid:$gid" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \\
+  --cap-drop ALL --security-opt no-new-privileges:true \\
+  --memory 768m --pids-limit 256 --cpu-shares 800 \\
+  --log-opt max-size=10m --log-opt max-file=3 \\
+  -v "$BASE:$BASE:ro" -v "$DATA:$DATA:rw" -w "$APP" \\
+  "$DOCKER_IMAGE" "$RUNTIME/bin/node" --disable-warning=ExperimentalWarning "$APP/server.js"
+RUN
+  chmod 750 "$CONF_DIR/run-container.sh"
+  # Nom de l'unité Docker (paquet officiel, snap…) ; aucune dépendance si Docker n'est pas géré par systemd.
+  local dunit="" u
+  for u in docker.service snap.docker.dockerd.service; do
+    if systemctl cat "$u" >/dev/null 2>&1; then dunit="$u"; break; fi
+  done
+  cat > "/etc/systemd/system/$SERVICE" <<UNIT
 [Unit]
-Description=Sauvegarde de la base MyCity ($NAME)
+Description=MyCity ($NAME) — ville numérique (conteneur Docker)
+Documentation=https://github.com/TheRemiDev/MyCity
+After=network-online.target ${dunit}
+${dunit:+Requires=$dunit}
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-User=$USER_NAME
-Group=$USER_NAME
-EnvironmentFile=$ENV_FILE
-ExecStart=$RUNTIME/bin/node --disable-warning=ExperimentalWarning $APP/scripts/backup.js $DATA/backups 14
-ProtectSystem=strict
-ReadWritePaths=$DATA
-PrivateTmp=true
-NoNewPrivileges=true
-UNIT
-  cat > "/etc/systemd/system/$NAME-backup.timer" <<UNIT
-[Unit]
-Description=Sauvegarde quotidienne de MyCity ($NAME)
-
-[Timer]
-OnCalendar=*-*-* 04:17:00
-RandomizedDelaySec=20m
-Persistent=true
+Type=simple
+ExecStartPre=-/usr/bin/env docker rm -f $CONTAINER
+ExecStart=/bin/bash $CONF_DIR/run-container.sh
+ExecStop=/usr/bin/env docker stop -t 15 $CONTAINER
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 UNIT
+}
+
+app_healthy() {
+  if [[ "$MODE" == docker ]]; then
+    docker exec "$CONTAINER" "$RUNTIME/bin/node" -e \
+      "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))" >/dev/null 2>&1
+  else
+    curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1
+  fi
+}
+
+setup_service() {
+  step "Service systemd $SERVICE (mode $MODE)"
+  write_backup_units
+  if [[ "$MODE" == docker ]]; then write_docker_unit; else write_host_unit; fi
+  state_set MODE "$MODE"
   systemctl daemon-reload
   systemctl enable --quiet "$SERVICE" "$NAME-backup.timer"
   systemctl restart "$SERVICE"
   systemctl start "$NAME-backup.timer"
 
   local _
-  for _ in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then ok "Service démarré sur 127.0.0.1:$PORT"; return; fi
+  for _ in $(seq 1 45); do
+    if app_healthy; then
+      if [[ "$MODE" == docker ]]; then ok "Conteneur « $CONTAINER » démarré"; else ok "Service démarré sur 127.0.0.1:$PORT"; fi
+      return 0
+    fi
     sleep 1
   done
   journalctl -u "$SERVICE" -n 30 --no-pager || true
@@ -368,21 +517,66 @@ UNIT
 }
 
 # ----------------------------------------------------------------- reverse proxy
+PROXY_KIND=""; PROXY_CONTAINER=""; PROXY_IMAGE=""; PROXY_NETWORK=""; PROXY_HOSTNET=0; PROXY_IP=""
+# shellcheck disable=SC2034 # renseignées par eval (detect-proxy.mjs)
+TRAEFIK_EP_HTTPS=""; TRAEFIK_EP_HTTP=""; TRAEFIK_RESOLVER=""; TRAEFIK_DOCKER=0; TRAEFIK_SWARM=0; TRAEFIK_FILE_DIR=""
+NGINX_PROXY_ACME=0; CADDYFILE_HOST=""; NGINX_CONFD_HOST=""
+
+detect_docker_proxy() {
+  docker_ok || return 1
+  local out
+  out="$("$RUNTIME/bin/node" "$APP/deploy/lib/detect-proxy.mjs")" || return 1
+  eval "$out"
+  [[ "$PROXY_KIND" != none && -n "$PROXY_KIND" ]]
+}
+
 detect_web_server() {
-  [[ "$WEB_SERVER" != "auto" ]] && return
-  local l80 l443
-  l80="$(listener_on 80)"; l443="$(listener_on 443)"
-  case "$l80$l443" in
-    *nginx*) WEB_SERVER=nginx ;;
-    *apache*|*httpd*) WEB_SERVER=apache ;;
-    *caddy*) WEB_SERVER=caddy ;;
-    "") if command -v nginx >/dev/null; then WEB_SERVER=nginx
-        elif command -v caddy >/dev/null; then WEB_SERVER=caddy
-        elif command -v apache2 >/dev/null || command -v httpd >/dev/null; then WEB_SERVER=apache
-        else WEB_SERVER=nginx; fi ;;
-    *) die "Les ports 80/443 sont occupés par « $l80 $l443 », que ce script ne sait pas configurer. Relancez avec --web-server none et configurez votre proxy vers 127.0.0.1:$PORT." ;;
-  esac
-  ok "Serveur web retenu : $WEB_SERVER"
+  step "Détection du serveur web en place"
+  if [[ "$WEB_SERVER" == docker ]]; then
+    detect_docker_proxy || die "Aucun reverse proxy Docker détecté (Traefik, Nginx Proxy Manager, nginx-proxy, Caddy…)."
+    MODE=docker
+  elif [[ "$WEB_SERVER" == auto ]]; then
+    local l80 l443
+    l80="$(listener_on 80)"; l443="$(listener_on 443)"
+    if [[ "$l80$l443" == *docker-proxy* ]] || listener_in_container 80 || listener_in_container 443; then
+      detect_docker_proxy || die "Les ports 80/443 sont tenus par un conteneur Docker, mais Docker est inaccessible pour l'analyser."
+      MODE=docker; WEB_SERVER=docker
+    else
+      case "$l80$l443" in
+        *nginx*) WEB_SERVER=nginx ;;
+        *apache*|*httpd*) WEB_SERVER=apache ;;
+        *caddy*) WEB_SERVER=caddy ;;
+        "")
+          if detect_docker_proxy; then MODE=docker; WEB_SERVER=docker
+          elif command -v nginx >/dev/null; then WEB_SERVER=nginx
+          elif command -v caddy >/dev/null; then WEB_SERVER=caddy
+          elif command -v apache2 >/dev/null || command -v httpd >/dev/null; then WEB_SERVER=apache
+          else WEB_SERVER=nginx; fi ;;
+        *) die "Les ports 80/443 sont tenus par « $l80 $l443 », que ce script ne sait pas piloter. Relancez avec --web-server none puis faites pointer ce proxy vers http://127.0.0.1:$PORT (en-têtes X-Forwarded-For et X-Forwarded-Proto)." ;;
+      esac
+    fi
+  fi
+  if [[ "$MODE" == docker ]]; then
+    case "$PROXY_KIND" in
+      traefik|npm|nginx-proxy|caddy-docker-proxy|caddy|nginx) ;;
+      *) die "Les ports 80/443 sont tenus par le conteneur « $PROXY_CONTAINER » ($PROXY_IMAGE), qui n'est pas un reverse proxy reconnu. Relancez avec --web-server none puis routez $DOMAIN vers http://127.0.0.1:$PORT depuis ce conteneur." ;;
+    esac
+    ok "Proxy Docker détecté : $PROXY_KIND (conteneur « $PROXY_CONTAINER », réseau « ${PROXY_NETWORK:-host} »)"
+    # Raccordement réseau du conteneur MyCity
+    if [[ "$PROXY_HOSTNET" == 1 ]]; then
+      state_set DOCKER_NET ""; state_set DOCKER_PUBLISH "127.0.0.1:$PORT:3000"; UPSTREAM="127.0.0.1:$PORT"
+    elif [[ -n "$PROXY_NETWORK" && "$PROXY_NETWORK" != bridge ]]; then
+      state_set DOCKER_NET "$PROXY_NETWORK"; state_set DOCKER_PUBLISH ""; UPSTREAM="$CONTAINER:3000"
+    else
+      # Réseau « bridge » par défaut : pas de DNS interne, on publie sur la passerelle Docker (jamais sur Internet).
+      local gw; gw="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
+      state_set DOCKER_NET ""; state_set DOCKER_PUBLISH "$gw:$PORT:3000"; UPSTREAM="$gw:$PORT"
+    fi
+    state_set PROXY_KIND "$PROXY_KIND"; state_set PROXY_CONTAINER "$PROXY_CONTAINER"
+  else
+    ok "Serveur web retenu : $WEB_SERVER"
+  fi
+  state_set WEB_SERVER "$WEB_SERVER"
 }
 
 SERVER_NAMES=""
@@ -408,6 +602,7 @@ obtain_cert() {
   step "Certificat Let's Encrypt pour $SERVER_NAMES"
   pkg_install certbot
   install -d -m 755 "$ACME_ROOT"
+  state_set ACME_ROOT "$ACME_ROOT"; state_set CERT_NAME "$NAME-$DOMAIN"
   local domains=(-d "$DOMAIN"); [[ $WITH_WWW -eq 1 ]] && domains+=(-d "www.$DOMAIN")
   local hook=""
   case "$WEB_SERVER" in
@@ -459,9 +654,11 @@ configure_nginx() {
   if [[ -d /etc/nginx/sites-available ]]; then
     file="/etc/nginx/sites-available/$NAME.conf"
     ln -sfn "$file" "/etc/nginx/sites-enabled/$NAME.conf"
+    state_add SITE_FILES "/etc/nginx/sites-enabled/$NAME.conf"
   else
     file="/etc/nginx/conf.d/$NAME.conf"
   fi
+  state_add SITE_FILES "$file"; state_set RELOAD_NGINX 1
   install -d -m 755 "$ACME_ROOT"
 
   local upstream="${NAME//-/_}_upstream"
@@ -535,12 +732,17 @@ configure_apache() {
   if command -v apache2 >/dev/null || [[ "$PKG" == apt ]]; then
     command -v apache2 >/dev/null || pkg_install apache2
     svc=apache2; conf_dir=/etc/apache2/sites-available; file="$conf_dir/$NAME.conf"
-    a2enmod -q proxy proxy_http headers ssl rewrite >/dev/null
+    local mod
+    for mod in proxy proxy_http headers ssl rewrite; do
+      if [[ ! -e "/etc/apache2/mods-enabled/$mod.load" ]]; then a2enmod -q "$mod" >/dev/null; state_add A2MODS "$mod"; fi
+    done
   else
     command -v httpd >/dev/null || pkg_install httpd mod_ssl
     svc=httpd; conf_dir=/etc/httpd/conf.d; file="$conf_dir/$NAME.conf"
   fi
   systemctl enable --quiet --now "$svc"
+  state_add SITE_FILES "$file"; state_set RELOAD_APACHE "$svc"
+  [[ $svc == apache2 ]] && state_add SITE_FILES "/etc/apache2/sites-enabled/$NAME.conf"
   local test_cmd="apachectl configtest"
   $test_cmd >/dev/null 2>&1 || die "La configuration Apache actuelle est déjà en erreur. Corrigez-la avant d'installer MyCity."
   install -d -m 755 "$ACME_ROOT"
@@ -593,9 +795,10 @@ configure_caddy() {
   install -d -m 755 "$dir"
   [[ -f "$main" ]] || touch "$main"
   if ! grep -qE "^import $dir/\*\.caddy" "$main"; then
-    cp -p "$main" "$main.bak-$NAME"
     printf '\nimport %s/*.caddy\n' "$dir" >> "$main"
+    state_set CADDY_IMPORT_ADDED "$main"
   fi
+  state_add SITE_FILES "$dir/$NAME.caddy"; state_set RELOAD_CADDY 1
   local site_names="$DOMAIN"; [[ $WITH_WWW -eq 1 ]] && site_names="$DOMAIN, www.$DOMAIN"
   [[ $TLS -eq 0 ]] && site_names="http://$DOMAIN"
   safe_apply "$dir/$NAME.caddy" "$site_names {
@@ -609,28 +812,243 @@ configure_caddy() {
   ok "Site actif ($dir/$NAME.caddy)"
 }
 
+# ----------------------------------------------------------------- proxys Docker
+docker_domains() { if [[ $WITH_WWW -eq 1 ]]; then echo "$DOMAIN www.$DOMAIN"; else echo "$DOMAIN"; fi; }
+
+# Étiquettes / variables lues par les proxys « à découverte automatique » : à écrire AVANT de lancer le conteneur.
+configure_docker_labels() {
+  : > "$CONF_DIR/docker.labels"; : > "$CONF_DIR/docker.env"
+  local rule="" d
+  for d in $(docker_domains); do rule="${rule:+$rule || }Host(\`$d\`)"; done
+  case "$PROXY_KIND" in
+    traefik)
+      if [[ "$TRAEFIK_SWARM" == 1 && "$TRAEFIK_DOCKER" != 1 ]]; then
+        die "Traefik fonctionne en mode Swarm : ajoutez un service vers http://$UPSTREAM, ou relancez avec --web-server none."
+      fi
+      if [[ "$TRAEFIK_DOCKER" == 1 ]]; then
+        {
+          echo "traefik.enable=true"
+          [[ -n "$(state_get DOCKER_NET)" ]] && echo "traefik.docker.network=$(state_get DOCKER_NET)"
+          echo "traefik.http.services.$NAME.loadbalancer.server.port=3000"
+          if [[ $TLS -eq 1 && -n "$TRAEFIK_EP_HTTPS" ]]; then
+            echo "traefik.http.routers.$NAME.rule=$rule"
+            echo "traefik.http.routers.$NAME.entrypoints=$TRAEFIK_EP_HTTPS"
+            echo "traefik.http.routers.$NAME.service=$NAME"
+            echo "traefik.http.routers.$NAME.tls=true"
+            [[ -n "$TRAEFIK_RESOLVER" ]] && echo "traefik.http.routers.$NAME.tls.certresolver=$TRAEFIK_RESOLVER"
+            if [[ -n "$TRAEFIK_EP_HTTP" ]]; then
+              echo "traefik.http.routers.$NAME-http.rule=$rule"
+              echo "traefik.http.routers.$NAME-http.entrypoints=$TRAEFIK_EP_HTTP"
+              echo "traefik.http.routers.$NAME-http.service=$NAME"
+              echo "traefik.http.routers.$NAME-http.middlewares=$NAME-https"
+              echo "traefik.http.middlewares.$NAME-https.redirectscheme.scheme=https"
+              echo "traefik.http.middlewares.$NAME-https.redirectscheme.permanent=true"
+            fi
+          else
+            echo "traefik.http.routers.$NAME-http.rule=$rule"
+            [[ -n "$TRAEFIK_EP_HTTP" ]] && echo "traefik.http.routers.$NAME-http.entrypoints=$TRAEFIK_EP_HTTP"
+            echo "traefik.http.routers.$NAME-http.service=$NAME"
+          fi
+        } > "$CONF_DIR/docker.labels"
+        ok "Routage Traefik par étiquettes Docker (entrée ${TRAEFIK_EP_HTTPS:-http}${TRAEFIK_RESOLVER:+, certificats « $TRAEFIK_RESOLVER »})"
+        [[ $TLS -eq 1 && -z "$TRAEFIK_RESOLVER" ]] && warn "Aucun résolveur ACME trouvé dans Traefik : il servira son certificat par défaut pour $DOMAIN."
+      fi ;;
+    nginx-proxy)
+      local hosts; hosts="$(docker_domains | tr ' ' ',')"
+      {
+        echo "VIRTUAL_HOST=$hosts"
+        echo "VIRTUAL_PORT=3000"
+        if [[ $TLS -eq 1 && "$NGINX_PROXY_ACME" == 1 ]]; then echo "LETSENCRYPT_HOST=$hosts"; echo "LETSENCRYPT_EMAIL=$EMAIL"; fi
+      } > "$CONF_DIR/docker.env"
+      ok "Routage nginx-proxy (VIRTUAL_HOST=$hosts)"
+      [[ $TLS -eq 1 && "$NGINX_PROXY_ACME" != 1 ]] && warn "Pas d'acme-companion détecté : HTTPS dépend de vos propres certificats nginx-proxy." ;;
+    caddy-docker-proxy)
+      local names; names="$(docker_domains | sed 's/ /, /g')"; [[ $TLS -eq 0 ]] && names="http://$DOMAIN"
+      {
+        echo "caddy=$names"
+        echo "caddy.reverse_proxy={{upstreams 3000}}"
+        echo "caddy.reverse_proxy.flush_interval=-1"
+      } > "$CONF_DIR/docker.labels"
+      ok "Routage caddy-docker-proxy (TLS automatique par Caddy)" ;;
+  esac
+  return 0
+}
+
+# Proxys configurés APRÈS le démarrage du conteneur (fichier ou API).
+configure_docker_proxy() {
+  step "Raccordement au proxy Docker « $PROXY_CONTAINER » ($PROXY_KIND)"
+  case "$PROXY_KIND" in
+    traefik)
+      if [[ "$TRAEFIK_DOCKER" != 1 ]]; then
+        [[ -n "$TRAEFIK_FILE_DIR" && -d "$TRAEFIK_FILE_DIR" ]] || die "Traefik n'utilise ni le fournisseur Docker ni un dossier de configuration dynamique accessible. Routez $DOMAIN vers http://$UPSTREAM, ou relancez avec --web-server none."
+        local f="$TRAEFIK_FILE_DIR/$NAME.yml" rule="" d
+        for d in $(docker_domains); do rule="${rule:+$rule || }Host(\`$d\`)"; done
+        {
+          echo "# MyCity ($NAME) — généré par deploy/install.sh"
+          echo "http:"
+          echo "  routers:"
+          echo "    $NAME:"
+          echo "      rule: \"$rule\""
+          [[ -n "$TRAEFIK_EP_HTTPS" && $TLS -eq 1 ]] && echo "      entryPoints: [\"$TRAEFIK_EP_HTTPS\"]"
+          echo "      service: $NAME"
+          if [[ $TLS -eq 1 ]]; then
+            echo "      tls:"
+            [[ -n "$TRAEFIK_RESOLVER" ]] && echo "        certResolver: $TRAEFIK_RESOLVER" || echo "        {}"
+          fi
+          echo "  services:"
+          echo "    $NAME:"
+          echo "      loadBalancer:"
+          echo "        servers:"
+          echo "          - url: \"http://$UPSTREAM\""
+        } > "$f"
+        state_add SITE_FILES "$f"
+        ok "Route Traefik ajoutée : $f"
+      else
+        ok "Traefik découvre le conteneur automatiquement"
+      fi ;;
+    nginx-proxy|caddy-docker-proxy) ok "Le proxy découvre le conteneur automatiquement" ;;
+    npm) configure_npm ;;
+    caddy) configure_caddy_container ;;
+    nginx) configure_nginx_container ;;
+  esac
+}
+
+configure_npm() {
+  local api="http://${PROXY_IP:-127.0.0.1}:81"; [[ "$PROXY_HOSTNET" == 1 ]] && api="http://127.0.0.1:81"
+  if [[ -z "$NPM_EMAIL" || -z "$NPM_PASSWORD" ]]; then
+    [[ -t 0 && $ASSUME_YES -eq 0 ]] || die "Nginx Proxy Manager détecté : fournissez ses identifiants admin (--npm-email et --npm-password, ou NPM_EMAIL/NPM_PASSWORD)."
+    echo "  Nginx Proxy Manager détecté : ses identifiants administrateur sont nécessaires pour ajouter le site."
+    [[ -n "$NPM_EMAIL" ]] || read -r -p "  E-mail admin NPM : " NPM_EMAIL
+    [[ -n "$NPM_PASSWORD" ]] || { read -r -s -p "  Mot de passe admin NPM : " NPM_PASSWORD; echo; }
+  fi
+  local res
+  res="$(NPM_EMAIL="$NPM_EMAIL" NPM_PASSWORD="$NPM_PASSWORD" "$RUNTIME/bin/node" "$APP/deploy/lib/npm-api.mjs" \
+    "$api" "$(docker_domains | tr ' ' ',')" "${UPSTREAM%:*}" "${UPSTREAM##*:}" "$EMAIL" "$TLS")" \
+    || die "L'API de Nginx Proxy Manager ($api) a refusé la demande (identifiants ?)."
+  local id; id="$(echo "$res" | awk '{print $2}')"
+  state_set NPM_API "$api"; state_set NPM_HOST_ID "$id"
+  if [[ "$res" == *notls* && $TLS -eq 1 ]]; then
+    warn "Site publié en HTTP : le certificat a été refusé (${res#*notls }). Réessayez depuis l'interface NPM une fois le DNS prêt."
+    PUBLIC_SCHEME=http
+  else ok "Proxy Host n°$id créé dans Nginx Proxy Manager (certificat Let’s Encrypt si HTTPS)"; fi
+}
+
+configure_caddy_container() {
+  [[ -n "$CADDYFILE_HOST" && -f "$CADDYFILE_HOST" ]] || die "Le Caddyfile du conteneur « $PROXY_CONTAINER » n'est pas monté depuis l'hôte : ajoutez-y « $DOMAIN { reverse_proxy $UPSTREAM } » ou relancez avec --web-server none."
+  local names; names="$(docker_domains | sed 's/ /, /g')"; [[ $TLS -eq 0 ]] && names="http://$DOMAIN"
+  local backup; backup="$(mktemp)"; cp -p "$CADDYFILE_HOST" "$backup"
+  # Bloc délimité par des marqueurs : retiré proprement à la désinstallation. Écriture « en place »
+  # (même inode) pour ne pas casser le montage du fichier dans le conteneur.
+  local content
+  content="$(sed "/^# >>> mycity:$NAME\$/,/^# <<< mycity:$NAME\$/d" "$backup")"
+  printf '%s\n\n# >>> mycity:%s\n%s {\n\treverse_proxy %s {\n\t\tflush_interval -1\n\t}\n}\n# <<< mycity:%s\n' \
+    "$content" "$NAME" "$names" "$UPSTREAM" "$NAME" > "$CADDYFILE_HOST"
+  if ! docker exec "$PROXY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    cat "$backup" > "$CADDYFILE_HOST"; rm -f "$backup"
+    die "Caddy refuse la configuration : rien n'a été modifié."
+  fi
+  rm -f "$backup"
+  docker exec "$PROXY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || warn "Rechargement de Caddy à faire manuellement."
+  state_set CADDYFILE_BLOCK "$CADDYFILE_HOST"
+  ok "Site ajouté au Caddyfile de « $PROXY_CONTAINER » (TLS automatique par Caddy)"
+}
+
+configure_nginx_container() {
+  [[ -n "$NGINX_CONFD_HOST" && -d "$NGINX_CONFD_HOST" ]] || die "Le dossier /etc/nginx/conf.d du conteneur « $PROXY_CONTAINER » n'est pas monté depuis l'hôte : routez $DOMAIN vers http://$UPSTREAM, ou relancez avec --web-server none."
+  local f="$NGINX_CONFD_HOST/$NAME.conf"
+  cat > "$f" <<NGX
+# MyCity ($NAME) — généré par deploy/install.sh
+server {
+    listen 80;
+    server_name $(docker_domains);
+    client_max_body_size 2m;
+    location / {
+        proxy_pass http://$UPSTREAM;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 1h;
+    }
+}
+NGX
+  if ! docker exec "$PROXY_CONTAINER" nginx -t >/dev/null 2>&1; then rm -f "$f"; die "nginx refuse la configuration : rien n'a été modifié."; fi
+  docker exec "$PROXY_CONTAINER" nginx -s reload >/dev/null 2>&1
+  state_add SITE_FILES "$f"
+  ok "Site ajouté à « $PROXY_CONTAINER » ($f)"
+  [[ $TLS -eq 1 ]] && warn "Ce conteneur nginx gère lui-même ses certificats : ajoutez HTTPS pour $DOMAIN dans sa configuration."
+  return 0
+}
+
 open_firewall() {
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null
+    local port
+    for port in 80 443; do
+      # On ne note que les règles réellement ajoutées par MyCity (jamais celles qui existaient déjà).
+      if ! ufw status 2>/dev/null | grep -qE "^$port(/tcp)?[[:space:]]+ALLOW"; then ufw allow "$port/tcp" >/dev/null; state_add UFW_RULES "$port/tcp"; fi
+    done
     ok "Pare-feu ufw : ports 80 et 443 autorisés"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --quiet --permanent --add-service=http --add-service=https && firewall-cmd --quiet --reload
+    local svc
+    for svc in http https; do
+      if ! firewall-cmd --permanent --query-service="$svc" >/dev/null 2>&1; then
+        firewall-cmd --quiet --permanent --add-service="$svc"; state_add FIREWALLD_SERVICES "$svc"
+      fi
+    done
+    firewall-cmd --quiet --reload
     ok "Pare-feu firewalld : http et https autorisés"
   fi
 }
 
+# Adresse IPv4 appartenant à Cloudflare ? (https://www.cloudflare.com/ips-v4)
+is_cloudflare_ip() {
+  local ip="$1" cidr net bits a b c d n1 n2 mask
+  IFS=. read -r a b c d <<<"$ip"; n1=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+  for cidr in 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 \
+              190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+              104.24.0.0/14 172.64.0.0/13 131.0.72.0/22; do
+    net="${cidr%/*}"; bits="${cidr#*/}"
+    IFS=. read -r a b c d <<<"$net"; n2=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+    mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    (( (n1 & mask) == (n2 & mask) )) && return 0
+  done
+  return 1
+}
+
 check_dns() {
-  [[ $DNS_CHECK -eq 1 && $TLS -eq 1 ]] || return 0
+  [[ $DNS_CHECK -eq 1 ]] || return 0
   step "Vérification DNS de $DOMAIN"
-  local public resolved
+  local public resolved first
   public="$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
   resolved="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
   if [[ -z "$resolved" ]]; then
+    [[ $TLS -eq 1 ]] || { warn "$DOMAIN ne résout pas encore."; return 0; }
     die "$DOMAIN ne résout vers aucune adresse. Créez un enregistrement A vers ${public:-l’IP de ce serveur}, attendez la propagation, puis relancez (ou --skip-dns-check)."
   fi
-  if [[ -n "$public" && " $resolved " != *" $public "* ]]; then
-    warn "$DOMAIN pointe vers $resolved alors que ce serveur sort avec $public (CDN/proxy ?). Le certificat risque d'échouer."
+  first="${resolved%% *}"
+  if is_cloudflare_ip "$first"; then
+    CLOUDFLARE=1
+    ok "$DOMAIN passe par Cloudflare ($resolved) : pris en charge."
+    echo "    Dans Cloudflare → SSL/TLS, choisissez le mode « Full (strict) » (ou « Full » le temps que le certificat soit émis)."
+  elif [[ -n "$public" && " $resolved " != *" $public "* ]]; then
+    warn "$DOMAIN pointe vers $resolved alors que ce serveur sort avec $public. Vérifiez l'enregistrement DNS, sinon le certificat échouera."
   else ok "$DOMAIN → $resolved"; fi
+}
+
+# Vérification de bout en bout : le domaine répond-il via le proxy local ? (sans dépendre du DNS)
+verify_public() {
+  [[ "$WEB_SERVER" == none ]] && return 0
+  step "Vérification de bout en bout"
+  local code _
+  for _ in $(seq 1 20); do
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { ok "https://$DOMAIN répond (via le proxy local)"; return 0; }
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/api/health" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { ok "http://$DOMAIN répond (via le proxy local)"; return 0; }
+    sleep 1
+  done
+  warn "Le proxy ne renvoie pas encore MyCity pour $DOMAIN (dernier code HTTP : ${code:-aucun}). L'application tourne ; vérifiez la configuration du proxy."
 }
 
 # ----------------------------------------------------------------- commandes
@@ -672,17 +1090,31 @@ cmd_install() {
   install_node
   deploy_code
   setup_user_and_config
-  setup_service
   detect_web_server
-  case "$WEB_SERVER" in
-    nginx) configure_nginx ;;
-    apache) configure_apache ;;
-    caddy) configure_caddy ;;
-    none) warn "Aucun reverse proxy configuré : dirigez votre proxy vers http://127.0.0.1:$PORT" ;;
-    *) die "Serveur web inconnu : $WEB_SERVER" ;;
-  esac
-  [[ "$WEB_SERVER" != none ]] && open_firewall
+  # IP réelle des visiteurs : on ne fait confiance qu'aux proxys locaux/Docker (et à Cloudflare s'il est devant).
+  if [[ $CLOUDFLARE -eq 1 ]]; then env_set TRUST_PROXY cloudflare
+  elif [[ "$MODE" == docker ]]; then env_set TRUST_PROXY private
+  else env_set TRUST_PROXY loopback; fi
+  if [[ "$MODE" == docker ]]; then
+    configure_docker_labels
+    setup_service
+    configure_docker_proxy
+  else
+    setup_service
+    case "$WEB_SERVER" in
+      nginx) configure_nginx ;;
+      apache) configure_apache ;;
+      caddy) configure_caddy ;;
+      none) warn "Aucun reverse proxy configuré : dirigez votre proxy vers http://127.0.0.1:$PORT" ;;
+      *) die "Serveur web inconnu : $WEB_SERVER" ;;
+    esac
+    [[ "$WEB_SERVER" != none ]] && open_firewall
+  fi
   rm -rf "$BASE/app.old"
+  state_flush_pkgs
+  verify_public
+  # Programme de désinstallation autonome (efface toute trace de MyCity)
+  install -m 750 "$APP/deploy/uninstall.sh" /usr/local/sbin/mycity-uninstall
 
   # Petit utilitaire d'administration
   cat > "/usr/local/sbin/$NAME-ctl" <<CTL
@@ -695,12 +1127,13 @@ case "\${1:-}" in
   backup) exec systemctl start $NAME-backup.service ;;
   update) shift; exec bash "$APP/deploy/install.sh" update --name $NAME "\$@" ;;
   config) exec \${EDITOR:-nano} $ENV_FILE ;;
-  *) echo "Usage : $NAME-ctl {logs|restart|status|backup|update|config}"; exit 1 ;;
+  uninstall) shift; exec /usr/local/sbin/mycity-uninstall --name $NAME "\$@" ;;
+  *) echo "Usage : $NAME-ctl {logs|restart|status|backup|update|config|uninstall}"; exit 1 ;;
 esac
 CTL
   chmod 755 "/usr/local/sbin/$NAME-ctl"
 
-  local scheme=https; [[ $TLS -eq 0 ]] && scheme=http
+  local scheme="${PUBLIC_SCHEME:-https}"; [[ $TLS -eq 0 ]] && scheme=http
   local token; token="$(env_get SETUP_TOKEN)"
   echo
   echo "${B}${G}════════════════════════════════════════════════════════════════${N}"
@@ -721,7 +1154,8 @@ CTL
     echo "  ${B}2. Paiements Stripe activés.${N} Webhook : $scheme://$DOMAIN/api/stripe/webhook"
   fi
   echo
-  echo "  ${B}Commandes utiles${N} : $NAME-ctl logs | restart | status | backup | update | config"
+  echo "  ${B}Commandes utiles${N} : $NAME-ctl logs | restart | status | backup | update | config | uninstall"
+  echo "  Tout désinstaller, sans laisser de trace : sudo mycity-uninstall"
   echo "  Données : $DATA   ·   Configuration : $ENV_FILE   ·   Sauvegardes quotidiennes : $DATA/backups"
   echo
 }
@@ -730,6 +1164,7 @@ cmd_update() {
   [[ -f "$ENV_FILE" ]] || die "Instance « $NAME » introuvable ($ENV_FILE). Lancez d'abord l'installation."
   step "Mise à jour de l'instance « $NAME »"
   PORT="$(env_get PORT)"
+  MODE="$(state_get MODE)"; MODE="${MODE:-host}"
   systemctl start "$NAME-backup.service" && ok "Sauvegarde préalable effectuée"
   install_node
   deploy_code
@@ -737,13 +1172,15 @@ cmd_update() {
   env_set INSTALL_BRANCH "$BRANCH"
   setup_service
   rm -rf "$BASE/app.old"
+  install -m 750 "$APP/deploy/uninstall.sh" /usr/local/sbin/mycity-uninstall
+  state_flush_pkgs
   ok "Mise à jour terminée"
 }
 
 cmd_status() {
   systemctl status "$SERVICE" --no-pager || true
-  local port; port="$(env_get PORT)"
-  [[ -n "$port" ]] && curl -fsS "http://127.0.0.1:$port/api/health" && echo
+  PORT="$(env_get PORT)"; MODE="$(state_get MODE)"; MODE="${MODE:-host}"
+  if app_healthy; then ok "Application en bonne santé (mode $MODE)"; else warn "L'application ne répond pas"; fi
 }
 
 cmd_backup() {
@@ -751,46 +1188,9 @@ cmd_backup() {
   ls -1t "$DATA/backups" | head -5
 }
 
-cmd_uninstall() {
-  step "Désinstallation de l'instance « $NAME »"
-  if [[ $ASSUME_YES -eq 0 && -t 0 ]]; then
-    local confirm=""; read -r -p "  Confirmer la désinstallation de $NAME ? (oui/non) " confirm
-    [[ "$confirm" == "oui" ]] || die "Annulé."
-  fi
-  local domain; domain="$(env_get BASE_URL | sed -E 's#^https?://##')"
-  systemctl disable --now "$SERVICE" "$NAME-backup.timer" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/$SERVICE" "/etc/systemd/system/$NAME-backup.service" "/etc/systemd/system/$NAME-backup.timer"
-  systemctl daemon-reload
-  if [[ -f "/etc/nginx/sites-enabled/$NAME.conf" || -f "/etc/nginx/conf.d/$NAME.conf" ]]; then
-    rm -f "/etc/nginx/sites-enabled/$NAME.conf" "/etc/nginx/sites-available/$NAME.conf" "/etc/nginx/conf.d/$NAME.conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx
-  fi
-  if [[ -f "/etc/apache2/sites-available/$NAME.conf" ]]; then
-    a2dissite -q "$NAME" >/dev/null 2>&1 || true
-    rm -f "/etc/apache2/sites-available/$NAME.conf"
-    apachectl configtest >/dev/null 2>&1 && systemctl reload apache2
-  fi
-  if [[ -f "/etc/httpd/conf.d/$NAME.conf" ]]; then
-    rm -f "/etc/httpd/conf.d/$NAME.conf"; apachectl configtest >/dev/null 2>&1 && systemctl reload httpd
-  fi
-  if [[ -f "/etc/caddy/sites/$NAME.caddy" ]]; then
-    rm -f "/etc/caddy/sites/$NAME.caddy"; systemctl reload caddy 2>/dev/null || true
-  fi
-  [[ -n "$domain" ]] && command -v certbot >/dev/null && certbot delete --cert-name "$NAME-$domain" --non-interactive >/dev/null 2>&1 || true
-  rm -rf "$BASE" "$ACME_ROOT" "/usr/local/sbin/$NAME-ctl"
-  if [[ $PURGE -eq 1 ]]; then
-    rm -rf "$DATA" "$CONF_DIR"
-    userdel "$USER_NAME" >/dev/null 2>&1 || true
-    ok "Instance et données supprimées"
-  else
-    ok "Instance supprimée. Données conservées dans $DATA et $CONF_DIR (--purge pour tout effacer)."
-  fi
-}
-
 case "$ACTION" in
   install) cmd_install ;;
   update) cmd_update ;;
   status) cmd_status ;;
   backup) cmd_backup ;;
-  uninstall) cmd_uninstall ;;
 esac

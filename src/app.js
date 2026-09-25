@@ -21,7 +21,7 @@ export function createApp(config, { fetchImpl, logger = console } = {}) {
 
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', config.trustProxy ? 1 : false);
+  app.set('trust proxy', config.trustProxy);
   app.use(securityHeaders);
 
   // Webhook Stripe : corps brut indispensable à la vérification de signature.
