@@ -94,7 +94,16 @@ ouvert sur Internet. Il rejoint le réseau du proxy.
 **Cloudflare**
 
 Détecté automatiquement. Les vraies IP des visiteurs sont retrouvées, en ne faisant confiance qu'aux adresses de
-Cloudflare. Dans Cloudflare → SSL/TLS, choisissez le mode **Full (strict)**.
+Cloudflare.
+
+Le défi Let's Encrypt classique échoue souvent derrière Cloudflare (symptôme : erreur 525). Le script reprend donc
+automatiquement la méthode TLS des autres sites du même domaine, dans cet ordre :
+1. un défi DNS Cloudflare, un certificat d'origine Cloudflare, ou `tls internal` déjà utilisé par un site voisin ;
+2. sinon, le défi DNS Cloudflare si le proxy dispose du module et d'un jeton ;
+3. en dernier recours, un certificat interne.
+
+Il vérifie ensuite la poignée de main TLS. Dans Cloudflare → SSL/TLS, choisissez **Full (strict)**, ou **Full** si le
+script indique qu'il a utilisé le certificat interne.
 
 **Proxy non reconnu** (HAProxy, application qui publie elle-même le port 80…)
 

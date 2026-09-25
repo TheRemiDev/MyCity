@@ -40,6 +40,7 @@
 #    --node-major M        version majeure de Node.js (défaut : 22)
 #    --www                 ajoute aussi www.<domaine> au certificat et au site
 #    --skip-dns-check      ne vérifie pas que le domaine pointe vers ce serveur
+#    --cloudflare          le domaine passe par le proxy Cloudflare (détecté automatiquement sinon)
 #    -y, --yes             ne pose aucune question
 # =============================================================================
 set -Eeuo pipefail
@@ -94,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --node-major) NODE_MAJOR="${2:-}"; shift 2 ;;
     --www) WITH_WWW=1; shift ;;
     --skip-dns-check) DNS_CHECK=0; shift ;;
+    --cloudflare) CLOUDFLARE=1; shift ;;
     --npm-email) NPM_EMAIL="${2:-}"; shift 2 ;;
     --npm-password) NPM_PASSWORD="${2:-}"; shift 2 ;;
     -y|--yes) ASSUME_YES=1; shift ;;
@@ -486,7 +488,7 @@ app_healthy() {
     docker exec "$CONTAINER" "$RUNTIME/bin/node" -e \
       "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))" >/dev/null 2>&1
   else
-    curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1
+    curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1
   fi
 }
 
@@ -933,24 +935,85 @@ configure_npm() {
   else ok "Proxy Host n°$id créé dans Nginx Proxy Manager (certificat Let’s Encrypt si HTTPS)"; fi
 }
 
-configure_caddy_container() {
-  [[ -n "$CADDYFILE_HOST" && -f "$CADDYFILE_HOST" ]] || die "Le Caddyfile du conteneur « $PROXY_CONTAINER » n'est pas monté depuis l'hôte : ajoutez-y « $DOMAIN { reverse_proxy $UPSTREAM } » ou relancez avec --web-server none."
+# Écrit (ou remplace) le bloc MyCity dans le Caddyfile monté, valide, recharge ; restaure en cas de refus.
+write_caddy_block() { # write_caddy_block "<directives tls éventuelles>"
+  local tls_lines="$1"
   local names; names="$(docker_domains | sed 's/ /, /g')"; [[ $TLS -eq 0 ]] && names="http://$DOMAIN"
   local backup; backup="$(mktemp)"; cp -p "$CADDYFILE_HOST" "$backup"
-  # Bloc délimité par des marqueurs : retiré proprement à la désinstallation. Écriture « en place »
-  # (même inode) pour ne pas casser le montage du fichier dans le conteneur.
-  local content
+  local content indented=""
   content="$(sed "/^# >>> mycity:$NAME\$/,/^# <<< mycity:$NAME\$/d" "$backup")"
-  printf '%s\n\n# >>> mycity:%s\n%s {\n\treverse_proxy %s {\n\t\tflush_interval -1\n\t}\n}\n# <<< mycity:%s\n' \
-    "$content" "$NAME" "$names" "$UPSTREAM" "$NAME" > "$CADDYFILE_HOST"
-  if ! docker exec "$PROXY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+  [[ -n "$tls_lines" ]] && indented="$(printf '%s\n' "$tls_lines" | sed 's/^/\t/')"$'\n'
+  # Écriture « en place » (même inode) pour ne pas casser le montage du fichier dans le conteneur.
+  printf '%s\n\n# >>> mycity:%s\n%s {\n%s\treverse_proxy %s {\n\t\tflush_interval -1\n\t}\n}\n# <<< mycity:%s\n' \
+    "$content" "$NAME" "$names" "$indented" "$UPSTREAM" "$NAME" > "$CADDYFILE_HOST"
+  # Le conteneur voit-il bien le fichier modifié ? (un montage de fichier devient « périmé » si le fichier
+  # a été remplacé au lieu d'être modifié, par exemple par un éditeur ou sed -i)
+  if ! docker exec "$PROXY_CONTAINER" grep -q "^# >>> mycity:$NAME\$" /etc/caddy/Caddyfile 2>/dev/null; then
     cat "$backup" > "$CADDYFILE_HOST"; rm -f "$backup"
-    die "Caddy refuse la configuration : rien n'a été modifié."
+    die "Le conteneur « $PROXY_CONTAINER » ne voit pas les modifications de $CADDYFILE_HOST (montage périmé). Redémarrez-le (docker restart $PROXY_CONTAINER) puis relancez ce script."
+  fi
+  if ! docker exec "$PROXY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/tmp/"$NAME"-caddy.log 2>&1; then
+    cat "$backup" > "$CADDYFILE_HOST"; rm -f "$backup"
+    tail -5 /tmp/"$NAME"-caddy.log
+    return 1
   fi
   rm -f "$backup"
-  docker exec "$PROXY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || warn "Rechargement de Caddy à faire manuellement."
+  docker exec "$PROXY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || warn "Rechargement de Caddy à faire manuellement."
   state_set CADDYFILE_BLOCK "$CADDYFILE_HOST"
-  ok "Site ajouté au Caddyfile de « $PROXY_CONTAINER » (TLS automatique par Caddy)"
+}
+
+# La poignée de main TLS réussit-elle pour ce domaine (certificat présent) ? Attend jusqu'à $1 secondes.
+tls_handshake_ok() {
+  local _ code
+  for _ in $(seq 1 "${1:-60}"); do
+    code="$(curl --noproxy '*' -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+configure_caddy_container() {
+  [[ -n "$CADDYFILE_HOST" && -f "$CADDYFILE_HOST" ]] || die "Le Caddyfile du conteneur « $PROXY_CONTAINER » n'est pas monté depuis l'hôte : ajoutez-y « $DOMAIN { reverse_proxy $UPSTREAM } » ou relancez avec --web-server none."
+  local tls_lines="" how="certificat Let's Encrypt automatique"
+  if [[ $TLS -eq 1 ]]; then
+    # 1. Faire comme les sites voisins du même domaine (défi DNS, certificat d'origine Cloudflare, snippet…)
+    tls_lines="$("$RUNTIME/bin/node" "$APP/deploy/lib/caddy-tls.mjs" "$CADDYFILE_HOST" "$DOMAIN" 2>/dev/null || true)"
+    [[ -n "$tls_lines" ]] && how="même méthode TLS que les autres sites : $(echo "$tls_lines" | head -1)"
+    # 2. Sinon, derrière Cloudflare : défi DNS si Caddy dispose du module et d'un jeton Cloudflare
+    if [[ -z "$tls_lines" && $CLOUDFLARE -eq 1 ]] \
+       && docker exec "$PROXY_CONTAINER" caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+      local var
+      var="$(docker exec "$PROXY_CONTAINER" env 2>/dev/null | grep -oE '^(CF_API_TOKEN|CLOUDFLARE_API_TOKEN|CF_DNS_API_TOKEN|CLOUDFLARE_DNS_API_TOKEN)=' | head -1 | tr -d '=')"
+      if [[ -n "$var" ]]; then
+        tls_lines="$(printf 'tls {\n\tdns cloudflare {env.%s}\n}' "$var")"
+        how="défi DNS Cloudflare (jeton $var du conteneur)"
+      fi
+    fi
+  fi
+  write_caddy_block "$tls_lines" || die "Caddy refuse la configuration : rien n'a été modifié."
+  ok "Site ajouté au Caddyfile de « $PROXY_CONTAINER » ($how)"
+  [[ $TLS -eq 1 ]] || return 0
+
+  echo "  Attente du certificat pour $DOMAIN (jusqu'à 90 s)…"
+  if tls_handshake_ok 90; then ok "Certificat en place : HTTPS opérationnel"; return 0; fi
+  warn "Caddy n'a pas obtenu de certificat pour $DOMAIN. Extrait de ses journaux :"
+  docker logs --since 5m "$PROXY_CONTAINER" 2>&1 | grep -iF "$DOMAIN" | grep -iE "error|fail|denied|invalid" | tail -3 | cut -c1-260 | sed 's/^/      /' || true
+  if [[ $CLOUDFLARE -eq 1 ]]; then
+    # Repli derrière Cloudflare : certificat interne de Caddy, accepté par Cloudflare en mode SSL « Full ».
+    write_caddy_block "tls internal" || die "Caddy refuse la configuration de repli."
+    state_set CADDY_TLS_FALLBACK internal
+    if tls_handshake_ok 30; then
+      ok "Repli appliqué : certificat interne Caddy (chiffrement Cloudflare ↔ serveur assuré)"
+      echo "    ${B}Action requise dans Cloudflare → SSL/TLS : mode « Full » (pas « Full (strict) »).${N}"
+      echo "    Pour le mode strict : ajoutez un défi DNS Cloudflare à Caddy ou un certificat d'origine Cloudflare, puis relancez ce script."
+    else
+      warn "Même le certificat interne n'est pas servi : vérifiez « docker logs $PROXY_CONTAINER »."
+    fi
+  else
+    warn "Vérifiez que $DOMAIN pointe bien vers ce serveur et que les ports 80/443 sont ouverts, puis relancez ce script."
+  fi
 }
 
 configure_nginx_container() {
@@ -1040,15 +1103,25 @@ check_dns() {
 verify_public() {
   [[ "$WEB_SERVER" == none ]] && return 0
   step "Vérification de bout en bout"
-  local code _
+  local code _ https_ok=0 http_ok=0
   for _ in $(seq 1 20); do
-    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" 2>/dev/null || true)"
-    [[ "$code" == 200 ]] && { ok "https://$DOMAIN répond (via le proxy local)"; return 0; }
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/api/health" 2>/dev/null || true)"
-    [[ "$code" == 200 ]] && { ok "http://$DOMAIN répond (via le proxy local)"; return 0; }
+    code="$(curl --noproxy '*' -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { https_ok=1; break; }
+    code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/api/health" 2>/dev/null || true)"
+    if [[ "$code" == 200 ]]; then http_ok=1; [[ $TLS -eq 0 ]] && break; fi
     sleep 1
   done
-  warn "Le proxy ne renvoie pas encore MyCity pour $DOMAIN (dernier code HTTP : ${code:-aucun}). L'application tourne ; vérifiez la configuration du proxy."
+  if [[ $https_ok -eq 1 ]]; then ok "https://$DOMAIN répond (via le proxy local)"
+  elif [[ $http_ok -eq 1 ]]; then
+    ok "http://$DOMAIN répond (via le proxy local)"
+    [[ $TLS -eq 1 ]] && { warn "HTTPS ne répond pas encore : certificat absent pour $DOMAIN."; PUBLIC_SCHEME=http; }
+  elif [[ "$code" =~ ^30[1278]$ ]]; then
+    warn "Le proxy redirige vers HTTPS, mais aucun certificat n'est servi pour $DOMAIN (poignée de main TLS impossible)."
+    [[ $CLOUDFLARE -eq 1 ]] && echo "    Derrière Cloudflare, cela provoque l'erreur 525. Voir la documentation de votre proxy pour le défi DNS Cloudflare."
+  else
+    warn "Le proxy ne renvoie pas encore MyCity pour $DOMAIN (dernier code HTTP : ${code:-aucun}). L'application tourne ; vérifiez la configuration du proxy."
+  fi
+  return 0
 }
 
 # ----------------------------------------------------------------- commandes
