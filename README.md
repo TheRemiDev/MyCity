@@ -59,11 +59,47 @@ par ce code : personne d'autre ne peut prendre la main sur votre instance.
 | Application | Code dans `/opt/mycity/app`, dépendances de production (`npm ci --omit=dev`). |
 | Isolation | Utilisateur système dédié `mycity`, sans shell. Service systemd durci (`ProtectSystem=strict`, `NoNewPrivileges`, mémoire bornée…). Écoute **uniquement sur 127.0.0.1**. |
 | Port | Premier port libre à partir de 3080, conservé lors des mises à jour. |
-| Reverse proxy | Réutilise **nginx**, **Apache** ou **Caddy** s'ils tournent déjà, sinon installe nginx. Ajoute **un seul fichier de site** dédié au domaine : les autres sites ne sont jamais modifiés. La configuration est testée avant chaque rechargement et restaurée en cas d'erreur. |
+| Reverse proxy | S'adapte à ce qui tient déjà les ports 80/443, voir ci-dessous. Les autres sites ne sont jamais modifiés, et chaque configuration est testée avant rechargement puis restaurée en cas d'erreur. |
 | HTTPS | Certificat Let's Encrypt pour ce seul domaine (`certbot --webroot`), redirection HTTP → HTTPS, renouvellement automatique. |
 | Pare-feu | Ouvre 80 et 443 si ufw ou firewalld est actif. |
 | Sauvegardes | Sauvegarde SQLite quotidienne à chaud, 14 jours conservés, dans `/var/lib/mycity/backups`. |
 | Configuration | `/etc/mycity/mycity.env`, lisible uniquement par root et `mycity`. |
+| Inventaire | Chaque élément créé (service, site, certificat, conteneur, paquet, règle de pare-feu) est noté dans `/etc/mycity/install.state`, pour une désinstallation sans trace qui ne touche jamais à l'existant. |
+| Vérification | Contrôle final de bout en bout : le domaine doit répondre à travers le proxy. |
+
+### Cohabitation avec les programmes déjà en place
+
+Le script détecte ce qui écoute sur les ports 80/443 et s'y greffe.
+
+**Serveur web installé directement sur l'hôte**
+
+| Serveur | Intégration |
+| --- | --- |
+| nginx, Apache, Caddy | Ajoute un seul fichier de site dédié au domaine. Certificat Let's Encrypt par `certbot --webroot` (Caddy gère le sien). |
+| Aucun | Installe nginx. |
+
+**Reverse proxy dans Docker** (cas typique : le processus `docker-proxy` tient 80/443)
+
+MyCity tourne alors dans un conteneur minimal et isolé : lecture seule, sans privilèges, mémoire bornée, aucun port
+ouvert sur Internet. Il rejoint le réseau du proxy.
+
+| Proxy | Intégration |
+| --- | --- |
+| **Traefik** (dont **Coolify**, **Dokploy**…) | Étiquettes Docker, ou fichier de configuration dynamique. Points d'entrée et résolveur ACME détectés automatiquement. |
+| **Nginx Proxy Manager** | Ajoute un « Proxy Host » avec certificat via son API. Identifiants admin demandés, ou `--npm-email` / `--npm-password`. |
+| **nginx-proxy** (+ acme-companion) | Variables `VIRTUAL_HOST` / `LETSENCRYPT_HOST`. |
+| **caddy-docker-proxy** | Étiquettes `caddy=…`. |
+| **Caddy** en conteneur | Bloc ajouté au Caddyfile monté, entre marqueurs. |
+
+**Cloudflare**
+
+Détecté automatiquement. Les vraies IP des visiteurs sont retrouvées, en ne faisant confiance qu'aux adresses de
+Cloudflare. Dans Cloudflare → SSL/TLS, choisissez le mode **Full (strict)**.
+
+**Proxy non reconnu** (HAProxy, application qui publie elle-même le port 80…)
+
+Le script s'arrête sans rien casser. Il indique précisément vers quelle adresse interne router le domaine, à utiliser
+avec `--web-server none`.
 
 Le script est **idempotent** : on peut le relancer sans risque. Il conserve les données, le port et les réglages.
 
@@ -73,7 +109,8 @@ Le script est **idempotent** : on peut le relancer sans risque. Il conserve les 
 sudo bash deploy/install.sh --help
   --name ville2                  # une 2e instance côte à côte (utilisateur, port, dossiers et site séparés)
   --www                          # inclut aussi www.<domaine>
-  --web-server nginx|apache|caddy|none
+  --web-server nginx|apache|caddy|docker|none
+  --npm-email admin@… --npm-password …   # si Nginx Proxy Manager est détecté
   --stripe-key sk_live_… --stripe-webhook whsec_…
   --port 3500                    # forcer le port interne
   --no-tls                       # HTTP seul (tests)
@@ -89,10 +126,32 @@ mycity-ctl restart
 mycity-ctl backup     # sauvegarde immédiate
 mycity-ctl config     # éditer la configuration (Stripe…), puis mycity-ctl restart
 mycity-ctl update     # mise à jour (sauvegarde préalable, retour arrière automatique si échec)
-
-sudo bash deploy/install.sh uninstall            # désinstaller (données conservées)
-sudo bash deploy/install.sh uninstall --purge    # tout supprimer
 ```
+
+### Désinstallation complète
+
+```bash
+sudo mycity-uninstall                  # ou : sudo bash deploy/uninstall.sh
+```
+
+Supprime **toute trace** de MyCity :
+- services et minuteurs systemd, conteneur Docker et image téléchargée pour l'occasion ;
+- sites ajoutés à nginx, Apache, Caddy, Traefik ou Nginx Proxy Manager, certificat Let's Encrypt, règles de pare-feu
+  ajoutées ;
+- code, Node.js privé, base de données, sauvegardes, configuration, utilisateur système ;
+- paquets installés par MyCity s'ils ne servent à rien d'autre, et le programme de désinstallation lui-même.
+
+Il ne touche jamais à ce qui existait avant MyCity, et reconnaît aussi les installations faites avec d'anciennes
+versions du script.
+
+Options :
+- `--backup-to /root/mycity.db` : exporter la base avant ;
+- `--keep-data` : garder les données ;
+- `--remove-source` : supprimer aussi le clone Git ;
+- `--name ville2` : une seule instance ;
+- `-y` : sans question.
+
+Seuls les messages déjà écrits dans le journal système (`journalctl`) subsistent, jusqu'à leur rotation normale.
 
 ### Encaisser de vrais paiements (Stripe)
 
@@ -136,7 +195,9 @@ public/
   js/shared/                   catalogue et générateur de ville, PARTAGÉS avec le serveur
   js/renderer.js · sprites.js  moteur isométrique (canvas) et dessin procédural
   js/ui/                       panneaux, éditeur, comptes, recherche, fil d'activité
-deploy/install.sh              installation, mise à jour et désinstallation automatisées
+deploy/install.sh              installation et mise à jour automatisées (détection des proxys, Cloudflare)
+deploy/uninstall.sh            désinstallation complète, sans trace
+deploy/lib/                    détection des proxys Docker, API Nginx Proxy Manager
 scripts/                       sauvegarde, données de démonstration
 test/                          tests node:test
 ```

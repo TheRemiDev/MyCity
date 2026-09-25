@@ -67,3 +67,17 @@ test('images : type déterminé par les octets', () => {
 test('encodage des paramètres Stripe', () => {
   assert.deepEqual(flatten({ a: 1, b: { c: 'x' }, d: [{ e: 2 }] }), { a: '1', 'b[c]': 'x', 'd[0][e]': '2' });
 });
+
+test('confiance envers les proxys : Cloudflare et réseaux privés uniquement', async () => {
+  const { parseTrustProxy } = await import('../src/config.js');
+  const express = (await import('express')).default;
+  const app = express();
+  app.set('trust proxy', parseTrustProxy('cloudflare'));
+  const trusted = app.get('trust proxy fn');
+  assert.equal(trusted('188.114.96.5', 0), true, 'IP Cloudflare');
+  assert.equal(trusted('172.18.0.3', 0), true, 'proxy Docker');
+  assert.equal(trusted('127.0.0.1', 0), true);
+  assert.equal(trusted('8.8.8.8', 0), false, "une IP publique quelconque ne peut pas usurper l'adresse du visiteur");
+  assert.equal(parseTrustProxy(''), false);
+  assert.equal(parseTrustProxy('1'), 1);
+});
